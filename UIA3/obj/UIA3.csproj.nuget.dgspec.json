@@ -1,20 +1,20 @@
 {
   "format": 1,
   "restore": {
-    "D:\\sai\\UIA3\\UIA3.csproj": {}
+    "E:\\act\\transfer\\UIA3\\UIA3.csproj": {}
   },
   "projects": {
-    "D:\\sai\\UIA3\\UIA3.csproj": {
+    "E:\\act\\transfer\\UIA3\\UIA3.csproj": {
       "version": "1.0.0",
       "restore": {
-        "projectUniqueName": "D:\\sai\\UIA3\\UIA3.csproj",
+        "projectUniqueName": "E:\\act\\transfer\\UIA3\\UIA3.csproj",
         "projectName": "UIA3",
-        "projectPath": "D:\\sai\\UIA3\\UIA3.csproj",
-        "packagesPath": "C:\\Users\\sairohith\\.nuget\\packages\\",
-        "outputPath": "D:\\sai\\UIA3\\obj\\",
+        "projectPath": "E:\\act\\transfer\\UIA3\\UIA3.csproj",
+        "packagesPath": "C:\\Users\\saiva\\.nuget\\packages\\",
+        "outputPath": "E:\\act\\transfer\\UIA3\\obj\\",
         "projectStyle": "PackageReference",
         "configFilePaths": [
-          "C:\\Users\\sairohith\\AppData\\Roaming\\NuGet\\NuGet.Config"
+          "C:\\Users\\saiva\\AppData\\Roaming\\NuGet\\NuGet.Config"
         ],
         "originalTargetFrameworks": [
           "net8.0-windows"
@@ -68,7 +68,7 @@
               "privateAssets": "all"
             }
           },
-          "runtimeIdentifierGraphPath": "C:\\Program Files\\dotnet\\sdk\\8.0.412/PortableRuntimeIdentifierGraph.json"
+          "runtimeIdentifierGraphPath": "C:\\Program Files\\dotnet\\sdk\\8.0.413/PortableRuntimeIdentifierGraph.json"
         }
       }
     }

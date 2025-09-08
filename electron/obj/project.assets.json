@@ -1630,23 +1630,24 @@
     "net8.0-windows7.0": [
       "FlaUI.UIA2 >= 5.0.0",
       "FlaUI.UIA3 >= 5.0.0",
+      "FlaUI.core >= 5.0.0",
       "Microsoft.Playwright >= 1.54.0"
     ]
   },
   "packageFolders": {
-    "C:\\Users\\sairohith\\.nuget\\packages\\": {}
+    "C:\\Users\\saiva\\.nuget\\packages\\": {}
   },
   "project": {
     "version": "1.0.0",
     "restore": {
-      "projectUniqueName": "D:\\sai\\electron\\electron.csproj",
+      "projectUniqueName": "E:\\act\\transfer\\electron\\electron.csproj",
       "projectName": "electron",
-      "projectPath": "D:\\sai\\electron\\electron.csproj",
-      "packagesPath": "C:\\Users\\sairohith\\.nuget\\packages\\",
-      "outputPath": "D:\\sai\\electron\\obj\\",
+      "projectPath": "E:\\act\\transfer\\electron\\electron.csproj",
+      "packagesPath": "C:\\Users\\saiva\\.nuget\\packages\\",
+      "outputPath": "E:\\act\\transfer\\electron\\obj\\",
       "projectStyle": "PackageReference",
       "configFilePaths": [
-        "C:\\Users\\sairohith\\AppData\\Roaming\\NuGet\\NuGet.Config"
+        "C:\\Users\\saiva\\AppData\\Roaming\\NuGet\\NuGet.Config"
       ],
       "originalTargetFrameworks": [
         "net8.0-windows"
@@ -1683,6 +1684,10 @@
             "target": "Package",
             "version": "[5.0.0, )"
           },
+          "FlaUI.core": {
+            "target": "Package",
+            "version": "[5.0.0, )"
+          },
           "Microsoft.Playwright": {
             "target": "Package",
             "version": "[1.54.0, )"
@@ -1704,7 +1709,7 @@
             "privateAssets": "all"
           }
         },
-        "runtimeIdentifierGraphPath": "C:\\Program Files\\dotnet\\sdk\\8.0.412/PortableRuntimeIdentifierGraph.json"
+        "runtimeIdentifierGraphPath": "C:\\Program Files\\dotnet\\sdk\\8.0.413/PortableRuntimeIdentifierGraph.json"
       }
     }
   }

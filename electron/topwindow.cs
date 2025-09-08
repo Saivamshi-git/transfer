@@ -8,6 +8,7 @@ using FlaUI.UIA3;
 using System.Diagnostics;
 using System.Reflection.Metadata.Ecma335;
 using System.Text;
+using System.Collections.Concurrent;
 
 //-----------------------------------------------------------------------------------------------------------------------
 // MODIFIED DTO: Simplified to its final form.
@@ -42,18 +43,15 @@ namespace DesktopElementInspector
         }
     }
 
-    public enum SemanticComponentType { Unknown, Navigation, MainContent, ToolBar, StatusBar, Dialog, Other }
 
     public class SemanticViewComponent
     {
         public string ComponentName { get; set; }
-        public SemanticComponentType ComponentType { get; set; }
         public List<TreeNode> RootNodes { get; set; }
 
-        public SemanticViewComponent(string name, SemanticComponentType type, List<TreeNode> nodes)
+        public SemanticViewComponent(string name, List<TreeNode> nodes)
         {
             ComponentName = name;
-            ComponentType = type;
             RootNodes = nodes;
         }
     }
@@ -63,15 +61,13 @@ namespace DesktopElementInspector
         public string ComponentName { get; }
         public Func<TreeNode, bool> Predicate { get; }
         public int Priority { get; }
-        public SemanticComponentType ComponentType { get; }
         public bool IsExpensive { get; }
 
-        public SemanticRule(string componentName, Func<TreeNode, bool> predicate, int priority, SemanticComponentType componentType, bool isExpensive = false)
+        public SemanticRule(string componentName, Func<TreeNode, bool> predicate, int priority, bool isExpensive = false)
         {
             ComponentName = componentName;
             Predicate = predicate;
             Priority = priority;
-            ComponentType = componentType;
             IsExpensive = isExpensive;
         }
     }
@@ -87,7 +83,11 @@ namespace DesktopElementInspector
     HashSet<string> UnimportantControlTypes,
     HashSet<string> InteractiveControlTypes,
     HashSet<string> StructuralControlTypes
-);
+    );
+    public record PrintLayout(
+        List<string> InfrastructureComponents,
+        List<string> ContentAndNavigationComponents
+    );
 
     public class OptimizedRuleProvider
     {
@@ -148,6 +148,108 @@ namespace DesktopElementInspector
         }
     }
 
+    public class UiEventHandler : IDisposable
+    {
+        private readonly UIA3Automation _automation;
+        private readonly AutomationElement _rootElement;
+
+        private StructureChangedEventHandlerBase? _structureChangedHandler;
+        private PropertyChangedEventHandlerBase? _propertyChangedHandler;
+
+        private readonly object _bufferLock = new();
+        private readonly HashSet<string> _eventBuffer = new();
+
+        private readonly Timer _flushTimer;
+        private readonly Stopwatch _sinceLastEvent = new Stopwatch();
+
+        private const int CheckIntervalMs = 30; // timer tick interval
+        private const int MinIdleMs = 50;       // minimum idle period to flush
+
+        public UiEventHandler(UIA3Automation automation, AutomationElement rootElement)
+        {
+            _automation = automation;
+            _rootElement = rootElement;
+
+            // Timer checks buffer every CheckIntervalMs
+            _flushTimer = new Timer(OnFlushTimerElapsed, null, Timeout.Infinite, Timeout.Infinite);
+        }
+
+        public void Start()
+        {
+            Console.WriteLine("--- Starting Event Listeners ---");
+
+            _structureChangedHandler = _rootElement.RegisterStructureChangedEvent(
+                TreeScope.Descendants,
+                OnStructureChanged);
+
+            _propertyChangedHandler = _rootElement.RegisterPropertyChangedEvent(
+                TreeScope.Descendants,
+                OnPropertyChanged,
+                _automation.PropertyLibrary.Element.Name,
+                _automation.PropertyLibrary.Element.IsEnabled,
+                _automation.PropertyLibrary.Element.IsOffscreen
+                
+            );
+
+            // start the flush timer
+            _flushTimer.Change(CheckIntervalMs, CheckIntervalMs);
+        }
+
+        private void OnStructureChanged(AutomationElement sender, StructureChangeType changeType, int[] runtimeId)
+        {
+            string key = $"STRUCT:{changeType}:{sender?.Properties.Name.ValueOrDefault}";
+            BufferEvent(key);
+        }
+
+        private void OnPropertyChanged(AutomationElement sender, PropertyId propertyId, object newValue)
+        {
+            string key = $"PROP:{propertyId.Name}:{sender?.Properties.Name.ValueOrDefault}:{newValue}";
+            BufferEvent(key);
+        }
+
+        private void BufferEvent(string eventKey)
+        {
+            lock (_bufferLock)
+            {
+                _eventBuffer.Add(eventKey);
+                _sinceLastEvent.Restart();
+            }
+        }
+
+        private void OnFlushTimerElapsed(object? state)
+        { 
+            HashSet<string>? toFlush = null;
+            long idleMs;
+
+            lock (_bufferLock)
+            {
+                if (_eventBuffer.Count == 0) return;
+
+                idleMs = _sinceLastEvent.ElapsedMilliseconds;
+                if (idleMs < MinIdleMs) return; // still within active period
+
+                toFlush = new HashSet<string>(_eventBuffer);
+                _eventBuffer.Clear();
+                _sinceLastEvent.Reset();
+            }
+
+            Console.WriteLine($"\n[Buffered Events Flushed after {idleMs} ms idle]:");
+            foreach (var ev in toFlush)
+                Console.WriteLine(ev);
+        }
+
+        public void Dispose()
+        {
+            Console.WriteLine("\n--- Stopping Event Listeners ---");
+            _structureChangedHandler?.Dispose();
+            _propertyChangedHandler?.Dispose();
+            _flushTimer.Dispose();
+        }
+    }
+
+
+
+
     
     // ===================================================================
     //  Semantic Rule Providers
@@ -156,9 +258,11 @@ namespace DesktopElementInspector
 
     public interface ISemanticRuleProvider
     {
+        bool IsElectronBased { get; }
         RuleSet GetRuleSet();
         EditorHelpDetails GetEditorHelpDetails();
         FilterRules GetFilterRules();
+        PrintLayout GetPrintLayout();
 
     }
 
@@ -168,6 +272,7 @@ namespace DesktopElementInspector
         public RuleSet GetRuleSet() => _cachedRuleSet;
         public EditorHelpDetails GetEditorHelpDetails() => new EditorHelpDetails(ErrorMessage: string.Empty);
 
+        public bool IsElectronBased => false;
         private static readonly FilterRules _cachedFilterRules = CreateFilterRules();
 
         public FilterRules GetFilterRules() => _cachedFilterRules;
@@ -184,37 +289,67 @@ namespace DesktopElementInspector
             return new FilterRules(unimportant, interactive, structural);
         }
 
+         public PrintLayout GetPrintLayout()
+    {
+        // List of infrastructure components, sorted by priority
+        var infrastructure = new List<string>
+        {
+            "TitleBar",
+            "NavigationToolBar",
+            "SearchBox",
+            "CommandBar",
+            "DetailsBar",
+            "StatusBar"
+        };
+
+        // List of content and navigation components, sorted by priority
+        var content = new List<string>
+        {
+            "PopupMenu",
+            "Window",
+            "TabBar",
+            "BreadcrumbBar",
+            "AddressBar(rootitem)",
+            "AddressBar(input)",
+            "NavigationPane",
+            "MainContent",
+            "Other Controls"
+        };
+
+        return new PrintLayout(infrastructure, content);
+    }
+
 
         private static RuleSet CreateRuleSet()
         {
             var rulesByControlType = new Dictionary<string, List<SemanticRule>>
             {
-                ["TitleBar"] = new List<SemanticRule> { new SemanticRule("TitleBar", n => n.Data.ControlType == "TitleBar", 100, SemanticComponentType.ToolBar) },
-                ["StatusBar"] = new List<SemanticRule> { new SemanticRule("StatusBar", n => n.Data.ControlType == "StatusBar", 80, SemanticComponentType.StatusBar) },
-                ["Tree"] = new List<SemanticRule> { new SemanticRule("NavigationPane", n => n.Data.Name == "Navigation Pane" && n.Data.ControlType == "Tree", 50, SemanticComponentType.Navigation) },
-                ["List"] = new List<SemanticRule> { new SemanticRule("MainContent", n => n.Data.Name == "Items View" && n.Data.ControlType == "List", 49, SemanticComponentType.MainContent) }
+                ["TitleBar"] = new List<SemanticRule> { new SemanticRule("TitleBar", n => n.Data.ControlType == "TitleBar", 100) },
+                ["StatusBar"] = new List<SemanticRule> { new SemanticRule("StatusBar", n => n.Data.ControlType == "StatusBar", 80) },
+                ["Tree"] = new List<SemanticRule> { new SemanticRule("NavigationPane", n => n.Data.Name == "Navigation Pane" && n.Data.ControlType == "Tree", 50) },
+                ["List"] = new List<SemanticRule> { new SemanticRule("MainContent", n => n.Data.Name == "Items View" && n.Data.ControlType == "List", 49) }
             };
 
             var rulesByClassName = new Dictionary<string, List<SemanticRule>>
             {
-                ["Microsoft.UI.Xaml.Controls.TabView"] = new List<SemanticRule> { new SemanticRule("TabBar", n => n.Data.ClassName == "Microsoft.UI.Xaml.Controls.TabView", 95, SemanticComponentType.Navigation) },
-                ["FileExplorerExtensions.FirstCrumbStackPanelControl"] = new List<SemanticRule> { new SemanticRule("AddressBar(rootitem)", n => n.Data.ClassName == "FileExplorerExtensions.FirstCrumbStackPanelControl", 91, SemanticComponentType.Navigation) }
+                ["Microsoft.UI.Xaml.Controls.TabView"] = new List<SemanticRule> { new SemanticRule("TabBar", n => n.Data.ClassName == "Microsoft.UI.Xaml.Controls.TabView", 95) },
+                ["FileExplorerExtensions.FirstCrumbStackPanelControl"] = new List<SemanticRule> { new SemanticRule("AddressBar(rootitem)", n => n.Data.ClassName == "FileExplorerExtensions.FirstCrumbStackPanelControl", 91) }
             };
 
             var otherShallowRules = new List<SemanticRule>
             {
-                new SemanticRule("PopupMenu", n => n.Data.Name != null && n.Data.Name.StartsWith("Popup"), 102, SemanticComponentType.Dialog)
+                new SemanticRule("PopupMenu", n => n.Data.Name != null && n.Data.Name.StartsWith("Popup"), 102)
             };
 
             var expensiveRules = new List<SemanticRule>
             {
-                new SemanticRule("Window", n => n.Parent == null && n.FindNodeInTree(c => c.Data.ControlType == "TitleBar") != null, 101, SemanticComponentType.Unknown, isExpensive: true),
-                new SemanticRule("NavigationToolBar", n => n.Data.ControlType == "AppBar" && n.FindNodeInTree(c => c.Data.Name == "Back") != null, 95, SemanticComponentType.ToolBar, isExpensive: true),
-                new SemanticRule("BreadcrumbBar", n => n.Data.ClassName == "LandmarkTarget" && n.FindNodeInTree(c => c.Data.ClassName == "FileExplorerExtensions.BreadcrumbBarItemControl") != null, 92, SemanticComponentType.Navigation, isExpensive: true),
-                new SemanticRule("AddressBar(input)", n => n.Data.ClassName == "AutoSuggestBox" && n.FindNodeInTree(c => c.Data.Name == "Address Bar") != null, 90, SemanticComponentType.Navigation, isExpensive: true),
-                new SemanticRule("SearchBox", n => n.Data.ClassName == "AutoSuggestBox" && n.FindNodeInTree(c => c.Data.Name != null && c.Data.Name.Trim().StartsWith("Search")) != null, 89, SemanticComponentType.ToolBar, isExpensive: true),
-                new SemanticRule("CommandBar", n => n.Data.ControlType == "AppBar" && n.FindNodeInTree(c => c.Data.Name == "Cut" || c.Data.Name == "View") != null, 85, SemanticComponentType.ToolBar, isExpensive: true),
-                new SemanticRule("DetailsBar", n => n.Data.ControlType == "AppBar" && n.FindNodeInTree(c => c.Data.Name == "Details") != null, 83, SemanticComponentType.ToolBar, isExpensive: true)
+                new SemanticRule("Window", n => n.Parent == null && n.FindNodeInTree(c => c.Data.ControlType == "TitleBar") != null, 101, isExpensive: true),
+                new SemanticRule("NavigationToolBar", n => n.Data.ControlType == "AppBar" && n.FindNodeInTree(c => c.Data.Name == "Back") != null, 95, isExpensive: true),
+                new SemanticRule("BreadcrumbBar", n => n.Data.ClassName == "LandmarkTarget" && n.FindNodeInTree(c => c.Data.ClassName == "FileExplorerExtensions.BreadcrumbBarItemControl") != null, 92, isExpensive: true),
+                new SemanticRule("AddressBar(input)", n => n.Data.ClassName == "AutoSuggestBox" && n.FindNodeInTree(c => c.Data.Name == "Address Bar") != null, 90, isExpensive: true),
+                new SemanticRule("SearchBox", n => n.Data.ClassName == "AutoSuggestBox" && n.FindNodeInTree(c => c.Data.Name != null && c.Data.Name.Trim().StartsWith("Search")) != null, 89, isExpensive: true),
+                new SemanticRule("CommandBar", n => n.Data.ControlType == "AppBar" && n.FindNodeInTree(c => c.Data.Name == "Cut" || c.Data.Name == "View") != null, 85, isExpensive: true),
+                new SemanticRule("DetailsBar", n => n.Data.ControlType == "AppBar" && n.FindNodeInTree(c => c.Data.Name == "Details") != null, 83, isExpensive: true)
             };
 
             var allRules = rulesByControlType.Values.SelectMany(r => r)
@@ -237,6 +372,7 @@ namespace DesktopElementInspector
 
         public EditorHelpDetails GetEditorHelpDetails() => new EditorHelpDetails(ErrorMessage: "Could not find an editor pane that supports text extraction via UI Automation.\n" + "FIX: Ensure accessibility support is enabled in VS Code. Press Shift+Alt+F1 for help or add the following to your settings.json file:\n" + "\"editor.accessibilitySupport\": \"on\"");
         
+        public bool IsElectronBased => true;
         private static FilterRules CreateFilterRules()
         {
             // Here we define the specific rules for File Explorer
@@ -244,23 +380,41 @@ namespace DesktopElementInspector
 
             var interactive = new HashSet<string> { "Button", "ListItem", "TreeItem", "TabItem", "ComboBox", "CheckBox", "RadioButton", "Hyperlink", "MenuItem", "EditItem", "SplitButton" };
 
-            var structural = new HashSet<string> { "Intermediate D3D Window", "PopupHost", "StatusBar", "MenuBar", "Tree", "List", "AppBar", "Tab", "Pane" , "ToolBar", "Window", "Document" };
+            var structural = new HashSet<string> { "Intermediate D3D Window", "PopupHost", "StatusBar", "MenuBar", "Tree", "List", "AppBar", "Tab", "Pane", "ToolBar", "Window", "Document" };
 
             return new FilterRules(unimportant, interactive, structural);
+        }
+       public PrintLayout GetPrintLayout()
+        {
+            // List of infrastructure components, sorted by priority
+            var infrastructure = new List<string>
+            {
+                "WindowControls", "MainToolbar", "LayoutControls", "Account-SettingsBar",
+                "EditorActions", "StatusBar"
+            };
+
+            // List of content and navigation components, sorted by priority
+            var content = new List<string>
+            {
+                "MenuBar", "ActivityBar", "SideBar", "EditorTabs",
+                "EditorGroup", "Panel", "Notifications","Other Controls"
+            };
+
+            return new PrintLayout(infrastructure, content);
         }
 
         private static RuleSet CreateRuleSet()
         {
             var rulesByControlType = new Dictionary<string, List<SemanticRule>>
             {
-                ["Button"] = new List<SemanticRule> { new SemanticRule("WindowControls", n => n.Data.ControlType == "Button" && (n.Data.Name == "Minimize" || n.Data.Name == "Restore" || n.Data.Name == "Maximize" || n.Data.Name == "Close"), 100, SemanticComponentType.ToolBar) },
+                ["Button"] = new List<SemanticRule> { new SemanticRule("WindowControls", n => n.Data.ControlType == "Button" && (n.Data.Name == "Minimize" || n.Data.Name == "Restore" || n.Data.Name == "Maximize" || n.Data.Name == "Close"), 100) },
                 ["ToolBar"] = new List<SemanticRule>
                 {
-                    new SemanticRule("LayoutControls", n => n.Data.ControlType == "ToolBar" && n.Data.Name == "Title actions", 88, SemanticComponentType.ToolBar),
-                    new SemanticRule("EditorActions", n => n.Data.ControlType == "ToolBar" && n.Data.Name == "Editor actions", 72, SemanticComponentType.ToolBar)
+                    new SemanticRule("LayoutControls", n => n.Data.ControlType == "ToolBar" && n.Data.Name == "Title actions", 88),
+                    new SemanticRule("EditorActions", n => n.Data.ControlType == "ToolBar" && n.Data.Name == "Editor actions", 72)
                 },
-                ["StatusBar"] = new List<SemanticRule> { new SemanticRule("StatusBar", n => n.Data.ControlType == "StatusBar", 50, SemanticComponentType.StatusBar) },
-                ["List"] = new List<SemanticRule> { new SemanticRule("Notifications", n => n.Data.ControlType == "List" && n.Data.Name != null && n.Data.Name.Contains("notification"), 40, SemanticComponentType.Dialog) }
+                ["StatusBar"] = new List<SemanticRule> { new SemanticRule("StatusBar", n => n.Data.ControlType == "StatusBar", 50) },
+                ["List"] = new List<SemanticRule> { new SemanticRule("Notifications", n => n.Data.ControlType == "List" && n.Data.Name != null && n.Data.Name.Contains("notification"), 40) }
             };
 
             var rulesByClassName = new Dictionary<string, List<SemanticRule>>();
@@ -272,14 +426,14 @@ namespace DesktopElementInspector
 
             var expensiveRules = new List<SemanticRule>
             {
-                new SemanticRule("EditorGroup", n => n.Data.ControlType == "Group" && n.FindNodeInTree(c => c.Data.ControlType == "Tab" && string.IsNullOrEmpty(c.Data.Name)) != null && n.FindNodeInTree(c => c.Data.ControlType == "Edit") != null, 70, SemanticComponentType.MainContent, isExpensive: true),
-                new SemanticRule("MenuBar", n => n.Data.ControlType == "MenuBar" && n.FindNodeInTree(c => c.Data.Name == "File") != null, 95, SemanticComponentType.Navigation, isExpensive: true),
-                new SemanticRule("MainToolbar", n => n.Data.ControlType == "ToolBar" && n.FindNodeInTree(c => c.Data.Name != null && c.Data.Name.StartsWith("Go Back")) != null, 90, SemanticComponentType.ToolBar, isExpensive: true),
-                new SemanticRule("ActivityBar", n => n.Data.Name == "Active View Switcher" && n.Data.ControlType == "Tab" && n.FindNodeInTree(c => c.Data.Name != null && c.Data.Name.Contains("Explorer (Ctrl+Shift+E)")) != null, 85, SemanticComponentType.Navigation, isExpensive: true),
-                new SemanticRule("Account-SettingsBar", n => n.Data.ControlType == "ToolBar" && n.FindNodeInTree(c => c.Data.Name == "Accounts" || c.Data.Name == "Manage") != null, 84, SemanticComponentType.ToolBar, isExpensive: true),
-                new SemanticRule("SideBar", n => n.Data.ControlType == "Group" && n.Children.Any(c => c.Data.ControlType == "ToolBar" && c.Data.Name != null && c.Data.Name.EndsWith("actions")) && n.FindNodeInTree(c => c.Data.ControlType == "Tree" || c.Data.ControlType == "List") != null, 80, SemanticComponentType.Navigation, isExpensive: true),
-                new SemanticRule("EditorTabs", n => n.Data.ControlType == "Tab" && n.FindNodeInTree(c => c.Data.ControlType == "TabItem") != null && n.FindNodeInTree(c => c.Data.Name == "Active View Switcher") == null, 71, SemanticComponentType.Navigation, isExpensive: true),
-                new SemanticRule("Panel", n => n.Data.ControlType == "Group" && n.FindNodeInTree(c => c.Data.ControlType == "TabItem" && c.Data.Name != null && (c.Data.Name.StartsWith("Problems") || c.Data.Name.StartsWith("Terminal"))) != null && n.FindNodeInTree(c => c.Data.Name == "Maximize Panel Size" || c.Data.Name == "Hide Panel (Ctrl+J)") != null, 60, SemanticComponentType.MainContent, isExpensive: true)
+                new SemanticRule("EditorGroup", n => n.Data.ControlType == "Group" && n.FindNodeInTree(c => c.Data.ControlType == "Tab" && string.IsNullOrEmpty(c.Data.Name)) != null && n.FindNodeInTree(c => c.Data.ControlType == "Edit") != null, 70, isExpensive: true),
+                new SemanticRule("MenuBar", n => n.Data.ControlType == "MenuBar" && n.FindNodeInTree(c => c.Data.Name == "File") != null, 95, isExpensive: true),
+                new SemanticRule("MainToolbar", n => n.Data.ControlType == "ToolBar" && n.FindNodeInTree(c => c.Data.Name != null && c.Data.Name.StartsWith("Go Back")) != null, 90, isExpensive: true),
+                new SemanticRule("ActivityBar", n => n.Data.Name == "Active View Switcher" && n.Data.ControlType == "Tab" && n.FindNodeInTree(c => c.Data.Name != null && c.Data.Name.Contains("Explorer (Ctrl+Shift+E)")) != null, 85, isExpensive: true),
+                new SemanticRule("Account-SettingsBar", n => n.Data.ControlType == "ToolBar" && n.FindNodeInTree(c => c.Data.Name == "Accounts" || c.Data.Name == "Manage") != null, 84, isExpensive: true),
+                new SemanticRule("SideBar", n => n.Data.ControlType == "Group" && n.Children.Any(c => c.Data.ControlType == "ToolBar" && c.Data.Name != null && c.Data.Name.EndsWith("actions")) && n.FindNodeInTree(c => c.Data.ControlType == "Tree" || c.Data.ControlType == "List") != null, 80, isExpensive: true),
+                new SemanticRule("EditorTabs", n => n.Data.ControlType == "Tab" && n.FindNodeInTree(c => c.Data.ControlType == "TabItem") != null && n.FindNodeInTree(c => c.Data.Name == "Active View Switcher") == null, 71, isExpensive: true),
+                new SemanticRule("Panel", n => n.Data.ControlType == "Group" && n.FindNodeInTree(c => c.Data.ControlType == "TabItem" && c.Data.Name != null && (c.Data.Name.StartsWith("Problems") || c.Data.Name.StartsWith("Terminal"))) != null && n.FindNodeInTree(c => c.Data.Name == "Maximize Panel Size" || c.Data.Name == "Hide Panel (Ctrl+J)") != null, 60, isExpensive: true)
             };
 
             var allRules = rulesByControlType.Values.SelectMany(r => r)
@@ -302,11 +456,11 @@ namespace DesktopElementInspector
         public FilterRules GetFilterRules() => _cachedFilterRules;
 
         public EditorHelpDetails GetEditorHelpDetails() => new EditorHelpDetails(ErrorMessage: "Could not find an editor pane that supports text extraction.");
-
+        public bool IsElectronBased => false;
         private static FilterRules CreateFilterRules()
         {
             // Here we define the specific rules for File Explorer
-            var unimportant = new HashSet<string> { "Image", "Separator"};
+            var unimportant = new HashSet<string> { "Image", "Separator" };
 
             var interactive = new HashSet<string> { "Button", "ListItem", "TreeItem", "TabItem", "ComboBox", "CheckBox", "RadioButton", "Hyperlink", "MenuItem", "EditItem", "SplitButton" };
 
@@ -314,16 +468,32 @@ namespace DesktopElementInspector
 
             return new FilterRules(unimportant, interactive, structural);
         }
+    public PrintLayout GetPrintLayout()
+        {
+            // List of infrastructure components, sorted by priority
+            var infrastructure = new List<string>
+            {
+                "Title Bar"
+            };
+
+            // List of content and navigation components, sorted by priority
+            var content = new List<string>
+            {
+                "Window","Other Controls"
+            };
+
+            return new PrintLayout(infrastructure, content);
+        }
         private static RuleSet CreateRuleSet()
         {
             var rulesByControlType = new Dictionary<string, List<SemanticRule>>
             {
-                ["TitleBar"] = new List<SemanticRule> { new SemanticRule("Title Bar", n => n.Data.ControlType == "TitleBar", 100, SemanticComponentType.ToolBar) }
+                ["TitleBar"] = new List<SemanticRule> { new SemanticRule("Title Bar", n => n.Data.ControlType == "TitleBar", 100) }
             };
             var rulesByClassName = new Dictionary<string, List<SemanticRule>>();
             var otherShallowRules = new List<SemanticRule>
             {
-                new SemanticRule("Window", n => n.Parent == null, 101, SemanticComponentType.Unknown)
+                new SemanticRule("Window", n => n.Parent == null, 101)
             };
             var expensiveRules = new List<SemanticRule>();
 
@@ -453,55 +623,91 @@ namespace DesktopElementInspector
     {
         private readonly UIA3Automation _automation;
         private readonly SemanticRuleFactory _ruleFactory = new();
+
+        private ISemanticRuleProvider? _ruleProvider;
+
         private List<SemanticRule> _rules = new List<SemanticRule>();
         private EditorHelpDetails _editorHelp = new("");
+        private readonly HashSet<IntPtr> _wokenUpWindows = new();
+
 
         public record ProcessedElementInfo(string DbId, string SummarizedName, string? name, string? ClassName, string ControlType, bool IsImportant, int IndentationLevel);
 
         public Dictionary<string, Dictionary<string, ProcessedElementInfo>> _componentCache = new();
         public readonly Dictionary<string, (AutomationElement? Element, string ComponentName, string Info)> _liveElementCache = new();
-        // NEW: Cache for unimportant elements for debugging
         public readonly List<DesktopScrapedElementDto> _unimportantCache = new();
 
         public TopWindowScraper(UIA3Automation automation)
         {
             _automation = automation;
         }
+        
+        private void RobustPing(AutomationElement element, int depth)
+        {
+            const int maxDepth = 8;
+            if (depth > maxDepth || element == null)
+            {
+                return;
+            }
+
+            try
+            {
+                var walker = _automation.TreeWalkerFactory.GetRawViewWalker();
+                //var walker = _automation.TreeWalkerFactory.GetControlViewWalker();
+                
+                var child = walker.GetFirstChild(element);
+
+                while (child != null)
+                {
+                    RobustPing(child, depth + 1);
+                    child = walker.GetNextSibling(child);
+                }
+            }
+            catch
+            {
+                // Ignore errors during the ping.
+            }
+        }
 
         public async Task AnalyzeSemantically()
         {
-            IntPtr initialHandle = IntPtr.Zero;
-            initialHandle = NativeMethods.GetForegroundWindow();
+            // 1. Get initial state
+            var stopwatcht = Stopwatch.StartNew();
+            IntPtr initialHandle = NativeMethods.GetForegroundWindow();
             var windowElement = _automation.FromHandle(initialHandle);
-            if (windowElement == null) return;
+            if (windowElement == null)
+            {
+                Console.WriteLine("VALIDATION FAILED: Could not get a handle to the foreground window.");
+                return;
+            }
 
+            // 5. Now, perform the main scrape
             var stopwatch = Stopwatch.StartNew();
 
-            TreeNode? semanticTreeRoot;
-            try
+            // 2. Determine the provider and decide if a warm-up is needed
+            _ruleProvider = _ruleFactory.GetProvider(windowElement);
+            bool needsWarmup = _ruleProvider.IsElectronBased && !_wokenUpWindows.Contains(initialHandle);
+
+            if (needsWarmup)
             {
-                IntPtr handleBefore = NativeMethods.GetForegroundWindow();
-                if (handleBefore != windowElement.Properties.NativeWindowHandle.ValueOrDefault)
+                try
                 {
-                    Console.WriteLine("VALIDATION FAILED: Focus changed before scrape could start.");
-                    return;
+                    RobustPing(windowElement, 1);
+                    _wokenUpWindows.Add(initialHandle);
                 }
-
-                semanticTreeRoot = await Task.Run(() => Scrape(windowElement));
-
-                stopwatch.Stop();
-                Console.WriteLine($"--- Time to scrape: {stopwatch.ElapsedMilliseconds} ms ---");
-
-                IntPtr handleAfter = NativeMethods.GetForegroundWindow();
-                if (handleBefore != handleAfter)
+                catch (Exception ex)
                 {
-                    Console.WriteLine("VALIDATION FAILED: Window focus changed *during* the scrape. Data is unreliable.");
-                    return;
+                    Console.WriteLine($"Warm-up ping failed: {ex.Message}. Proceeding anyway.");
                 }
             }
-            catch (Exception ex)
+            TreeNode? semanticTreeRoot = await Task.Run(() => Scrape(windowElement));
+            stopwatch.Stop();
+            Console.WriteLine($"--- Time to scrape: {stopwatch.ElapsedMilliseconds} ms ---");
+
+            // Final check for sanity
+            if (NativeMethods.GetForegroundWindow() != initialHandle)
             {
-                Console.WriteLine($"VALIDATION FAILED: Scrape was interrupted by an internal error: {ex.Message}");
+                Console.WriteLine("VALIDATION FAILED: Window focus changed *during* the scrape. Data is unreliable.");
                 return;
             }
 
@@ -512,22 +718,34 @@ namespace DesktopElementInspector
             }
 
             var stopwatche = Stopwatch.StartNew();
-
-            var ruleProvider = _ruleFactory.GetProvider(windowElement);
-            _editorHelp = ruleProvider.GetEditorHelpDetails();
-
-            var nodeToRuleMap = ClassifyNodes(semanticTreeRoot, ruleProvider);
+            _editorHelp = _ruleProvider.GetEditorHelpDetails();
+            var nodeToRuleMap = ClassifyNodes(semanticTreeRoot, _ruleProvider);
             stopwatche.Stop();
             Console.WriteLine($"--- Time to classify: {stopwatche.ElapsedMilliseconds} ms ---");
 
             var stopwatch2 = Stopwatch.StartNew();
-
-            FinalizeAndCacheComponentsOptimized(semanticTreeRoot, nodeToRuleMap, ruleProvider);
-
+            FinalizeAndCacheComponentsOptimized(semanticTreeRoot, nodeToRuleMap, _ruleProvider);
             stopwatch2.Stop();
             Console.WriteLine($"--- Time to group: {stopwatch2.ElapsedMilliseconds} ms ---");
-        }
+            var stopwatchp = Stopwatch.StartNew();
+            PrintSemanticView();
+            stopwatchp.Stop();
+            Console.WriteLine($"--- Time to print: {stopwatchp.ElapsedMilliseconds} ms ---");
 
+            stopwatcht.Stop();
+            Console.WriteLine($"--- Time for Total: {stopwatcht.ElapsedMilliseconds} ms ---");
+
+            using (var handler = new UiEventHandler(_automation, windowElement))
+            {
+                handler.Start();
+
+                Console.WriteLine("\nEvent listeners are now active.");
+                Console.WriteLine("Interact with the target window to see real-time UI changes...");
+                Console.WriteLine("Press any key to stop listening and exit.\n");
+
+                Console.ReadKey();
+            }
+        }
         public string? GetComponentNameBySignature(string? signature)
         {
             if (signature == null) return null;
@@ -541,46 +759,40 @@ namespace DesktopElementInspector
         public void PrintSemanticView()
         {
             Console.WriteLine("\n--- Semantic Window Summary ---");
-            if (_componentCache.Count == 0)
+            if (_componentCache.Count == 0 || _ruleProvider == null)
             {
                 Console.WriteLine("No components were found or analyzed.");
                 return;
             }
 
-            var ruleLookup = _rules.ToDictionary(r => r.ComponentName);
-            var componentNames = _componentCache.Keys.ToList();
+            PrintLayout layout = _ruleProvider.GetPrintLayout();
+            Console.ForegroundColor = ConsoleColor.Yellow;
+            Console.WriteLine("\n\n--- Infrastructure Components ---");
+            Console.ResetColor();
 
-            var toolAndStatusComponents = componentNames.Where(name =>
-                ruleLookup.TryGetValue(name, out var rule) &&
-                (rule.ComponentType == SemanticComponentType.ToolBar || rule.ComponentType == SemanticComponentType.StatusBar)
-            ).ToList();
-            var otherComponents = componentNames.Except(toolAndStatusComponents).ToList();
-
-            var priorityLookup = _rules.ToDictionary(r => r.ComponentName, r => r.Priority);
-
-            if (toolAndStatusComponents.Any())
+            foreach (var componentName in layout.InfrastructureComponents)
             {
-                Console.ForegroundColor = ConsoleColor.Yellow;
-                Console.WriteLine("\n\n--- Infrastructure Components ---");
-                Console.ResetColor();
-                foreach (var componentName in toolAndStatusComponents.OrderByDescending(name => priorityLookup.GetValueOrDefault(name, 0)))
+                // Just check if the component exists and print it
+                if (_componentCache.ContainsKey(componentName))
                 {
                     PrintComponentDetails(componentName);
                 }
             }
 
-            if (otherComponents.Any())
+            // --- Print Content & Navigation Components ---
+            Console.ForegroundColor = ConsoleColor.Cyan;
+            Console.WriteLine("\n\n--- Content & Navigation Components ---");
+            Console.ResetColor();
+
+            foreach (var componentName in layout.ContentAndNavigationComponents)
             {
-                Console.ForegroundColor = ConsoleColor.Cyan;
-                Console.WriteLine("\n\n--- Content & Navigation Components ---");
-                Console.ResetColor();
-                foreach (var componentName in otherComponents.OrderByDescending(name => priorityLookup.GetValueOrDefault(name, 0)))
+                // Just check if the component exists and print it
+                if (_componentCache.ContainsKey(componentName))
                 {
                     PrintComponentDetails(componentName);
                 }
             }
         }
-
         private void PrintComponentDetails(string componentName)
         {
             Console.ForegroundColor = ConsoleColor.Green;
@@ -611,9 +823,6 @@ namespace DesktopElementInspector
 
                     foreach (var editorInfo in potentialEditorElements)
                     {
-                        // *** THIS IS THE FIX ***
-                        // We get the signature directly from the DbId stored in ProcessedElementInfo.
-                        // No need to access a non-existent OriginalDto.
                         string signature = editorInfo.DbId.Substring(editorInfo.DbId.IndexOf(':') + 1);
 
                         if (_liveElementCache.TryGetValue(signature, out var cacheEntry))
@@ -705,7 +914,7 @@ namespace DesktopElementInspector
             if (!node.Data.IsImportant)
             {
                 // NEW: Add the unimportant DTO to our debug cache.
-                _unimportantCache.Add(node.Data);
+                //_unimportantCache.Add(node.Data);
 
                 // For unimportant nodes, pass the parent's indent level down without incrementing
                 foreach (var child in node.Children)
@@ -783,53 +992,102 @@ namespace DesktopElementInspector
 
             return "Unnamed";
         }
+public TreeNode? Scrape(AutomationElement elementToScrape)
+{
+    if (elementToScrape == null) return null;
 
-        public TreeNode? Scrape(AutomationElement elementToScrape)
+    var ruleProvider = _ruleFactory.GetProvider(elementToScrape);
+    var filterRules = ruleProvider.GetFilterRules();
+
+    // 1. Create the root node outside the parallel process
+    var rootDto = CreateDtoFromElement(elementToScrape, null, filterRules);
+    if (rootDto == null) return null;
+    var rootNode = new TreeNode(rootDto) { LiveElement = elementToScrape };
+
+    // 2. Set up the concurrent work queue. The items are a tuple of the
+    //    element to process and the parent TreeNode it belongs to.
+    using var workQueue = new BlockingCollection<(AutomationElement element, TreeNode parentNode)>();
+    
+    // We use Interlocked to safely count pending items across threads.
+    int itemsToProcess = 0;
+
+    // 3. Initial Population: Add the first level of children to the queue
+    var walker = _automation.TreeWalkerFactory.GetRawViewWalker();
+    //var walker = _automation.TreeWalkerFactory.GetControlViewWalker();
+
+    var initialChild = walker.GetFirstChild(elementToScrape);
+    while (initialChild != null)
+    {
+        workQueue.Add((initialChild, rootNode));
+        Interlocked.Increment(ref itemsToProcess);
+        initialChild = walker.GetNextSibling(initialChild);
+    }
+    
+    // If there are no children, we are done.
+    if (itemsToProcess == 0)
+    {
+        return rootNode;
+    }
+
+    // 4. Create and start worker tasks
+    var workerTasks = new List<Task>();
+    int workerCount = Environment.ProcessorCount; // Use a sensible number of workers
+
+    for (int i = 0; i < workerCount; i++)
+    {
+        workerTasks.Add(Task.Run(() =>
         {
-            if (elementToScrape == null) return null;
-
-            var ruleProvider = _ruleFactory.GetProvider(elementToScrape);
-
-            var filterRules = ruleProvider.GetFilterRules();
+            // Each worker gets its own TreeWalker for thread safety
+            var taskWalker = _automation.TreeWalkerFactory.GetRawViewWalker();
+                //var taskWalker = _automation.TreeWalkerFactory.GetControlViewWalker();
 
 
-            var rootDto = CreateDtoFromElement(elementToScrape, null, filterRules);
-            if (rootDto == null)
+            foreach (var (currentElement, parentTreeNode) in workQueue.GetConsumingEnumerable())
             {
-                // This should not happen with the final logic, but it is a safeguard.
-                return null;
-            }
-
-            var rootNode = new TreeNode(rootDto) { LiveElement = elementToScrape };
-            var queue = new Queue<(AutomationElement element, TreeNode parentNode)>();
-            queue.Enqueue((elementToScrape, rootNode));
-
-            var walker = _automation.TreeWalkerFactory.GetRawViewWalker();
-
-            while (queue.Count > 0)
-            {
-                var (currentElement, parentTreeNode) = queue.Dequeue();
-                var childElement = walker.GetFirstChild(currentElement);
-                while (childElement != null)
+                try
                 {
-                    try
-                    {
-                        var dto = CreateDtoFromElement(childElement, parentTreeNode, filterRules);
-                        // In this final architecture, the dto is never null.
+                    // a. Process the current element to create its DTO and TreeNode
+                    var dto = CreateDtoFromElement(currentElement, parentTreeNode, filterRules);
+                    var childNode = new TreeNode(dto) { LiveElement = currentElement, Parent = parentTreeNode };
 
-                        var childNode = new TreeNode(dto) { LiveElement = childElement, Parent = parentTreeNode };
-                        parentTreeNode.Children.Add(childNode);
-                        queue.Enqueue((childElement, childNode));
-                    }
-                    catch (Exception ex)
+                    // b. CRITICAL: Add the new node to its parent's children list inside a lock
+                    //    to prevent multiple threads from modifying the list at the same time.
+                    lock (parentTreeNode.Children)
                     {
-                        LogScrapeException(ex, childElement);
+                        parentTreeNode.Children.Add(childNode);
                     }
-                    childElement = walker.GetNextSibling(childElement);
+
+                    // c. Find all children of the current element
+                    var grandChild = taskWalker.GetFirstChild(currentElement);
+                    while (grandChild != null)
+                    {
+                        // d. Add new work items to the queue
+                        workQueue.Add((grandChild, childNode));
+                        Interlocked.Increment(ref itemsToProcess);
+                        grandChild = taskWalker.GetNextSibling(grandChild);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    LogScrapeException(ex, currentElement);
+                }
+                finally
+                {
+                    // e. Decrement the counter. If we are the last one, signal completion.
+                    if (Interlocked.Decrement(ref itemsToProcess) == 0)
+                    {
+                        workQueue.CompleteAdding();
+                    }
                 }
             }
-            return rootNode;
-        }
+        }));
+    }
+
+    // 5. Wait for all worker tasks to complete
+    Task.WhenAll(workerTasks).Wait();
+
+    return rootNode;
+}
 
         private bool HasMeaningfulContent(string? name, string? className)
         {

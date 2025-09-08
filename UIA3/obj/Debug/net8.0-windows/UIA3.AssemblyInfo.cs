@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("UIA3")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+a9b7631554f67c99f2756d86b2487b0d6fad6fa6")]
 [assembly: System.Reflection.AssemblyProductAttribute("UIA3")]
 [assembly: System.Reflection.AssemblyTitleAttribute("UIA3")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]

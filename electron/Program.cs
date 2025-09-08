@@ -103,12 +103,10 @@ namespace DesktopElementInspector
                     // PrintTree(rootNode);
 
                     //----------------------------------------------------------------------------------------------------------------------------------------------------
+                    
                     await topWindowScraper.AnalyzeSemantically();
-                    var stopwatchp = Stopwatch.StartNew();
-                    topWindowScraper.PrintSemanticView();
-                    stopwatchp.Stop();
-                    Console.WriteLine($"--- Time to group: {stopwatchp.ElapsedMilliseconds} ms ---");
-                    topWindowScraper.PrintUnimportantElementsForDebugging();
+                    
+                    //topWindowScraper.PrintUnimportantElementsForDebugging();
                     //---------------------------------------------------------------------------------------------------------------------------------------------------
 
                 }

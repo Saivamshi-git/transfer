@@ -10,6 +10,7 @@
         "dependencies": {
           "FlaUI.UIA2": "5.0.0",
           "FlaUI.UIA3": "5.0.0",
+          "FlaUI.Core": "5.0.0",
           "Microsoft.Playwright": "1.54.0"
         },
         "runtime": {

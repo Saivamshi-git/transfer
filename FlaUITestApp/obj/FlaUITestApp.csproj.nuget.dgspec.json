@@ -1,20 +1,20 @@
 {
   "format": 1,
   "restore": {
-    "D:\\sai\\FlaUITestApp\\FlaUITestApp.csproj": {}
+    "E:\\act\\transfer\\FlaUITestApp\\FlaUITestApp.csproj": {}
   },
   "projects": {
-    "D:\\sai\\FlaUITestApp\\FlaUITestApp.csproj": {
+    "E:\\act\\transfer\\FlaUITestApp\\FlaUITestApp.csproj": {
       "version": "1.0.0",
       "restore": {
-        "projectUniqueName": "D:\\sai\\FlaUITestApp\\FlaUITestApp.csproj",
+        "projectUniqueName": "E:\\act\\transfer\\FlaUITestApp\\FlaUITestApp.csproj",
         "projectName": "FlaUITestApp",
-        "projectPath": "D:\\sai\\FlaUITestApp\\FlaUITestApp.csproj",
-        "packagesPath": "C:\\Users\\sairohith\\.nuget\\packages\\",
-        "outputPath": "D:\\sai\\FlaUITestApp\\obj\\",
+        "projectPath": "E:\\act\\transfer\\FlaUITestApp\\FlaUITestApp.csproj",
+        "packagesPath": "C:\\Users\\saiva\\.nuget\\packages\\",
+        "outputPath": "E:\\act\\transfer\\FlaUITestApp\\obj\\",
         "projectStyle": "PackageReference",
         "configFilePaths": [
-          "C:\\Users\\sairohith\\AppData\\Roaming\\NuGet\\NuGet.Config"
+          "C:\\Users\\saiva\\AppData\\Roaming\\NuGet\\NuGet.Config"
         ],
         "originalTargetFrameworks": [
           "net8.0-windows"
@@ -72,7 +72,7 @@
               "privateAssets": "all"
             }
           },
-          "runtimeIdentifierGraphPath": "C:\\Program Files\\dotnet\\sdk\\8.0.412/PortableRuntimeIdentifierGraph.json"
+          "runtimeIdentifierGraphPath": "C:\\Program Files\\dotnet\\sdk\\8.0.413/PortableRuntimeIdentifierGraph.json"
         }
       }
     }
