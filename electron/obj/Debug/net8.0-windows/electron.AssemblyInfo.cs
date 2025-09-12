@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("electron")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+a9b7631554f67c99f2756d86b2487b0d6fad6fa6")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+c214d129f4d9be8744807cf28685ee21ed6e36b9")]
 [assembly: System.Reflection.AssemblyProductAttribute("electron")]
 [assembly: System.Reflection.AssemblyTitleAttribute("electron")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]

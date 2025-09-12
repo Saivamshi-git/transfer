@@ -10,6 +10,9 @@ using System.Reflection.Metadata.Ecma335;
 using System.Text;
 using System.Collections.Concurrent;
 
+
+using System.Net.NetworkInformation;
+using System.Runtime.InteropServices;
 //-----------------------------------------------------------------------------------------------------------------------
 // MODIFIED DTO: Simplified to its final form.
 public record DesktopScrapedElementDto(
@@ -147,110 +150,729 @@ namespace DesktopElementInspector
             return null;
         }
     }
+    
 
-    public class UiEventHandler : IDisposable
+
+
+
+
+
+// A simple record to identify the trigger of an operation.
+public record ActionEventInfo(string Signature, string EventType, string Name, AutomationElement Element);
+
+
+
+    public static class TcpConnectionHelper
     {
-        private readonly UIA3Automation _automation;
-        private readonly AutomationElement _rootElement;
+        // We need to P/Invoke to get the process ID associated with a TCP connection.
+        [DllImport("iphlpapi.dll", SetLastError = true)]
+        private static extern uint GetExtendedTcpTable(IntPtr pTcpTable, ref int pdwSize, bool bOrder, int ulAf, TcpTableClass tableClass, uint reserved);
 
-        private StructureChangedEventHandlerBase? _structureChangedHandler;
-        private PropertyChangedEventHandlerBase? _propertyChangedHandler;
-
-        private readonly object _bufferLock = new();
-        private readonly HashSet<string> _eventBuffer = new();
-
-        private readonly Timer _flushTimer;
-        private readonly Stopwatch _sinceLastEvent = new Stopwatch();
-
-        private const int CheckIntervalMs = 30; // timer tick interval
-        private const int MinIdleMs = 50;       // minimum idle period to flush
-
-        public UiEventHandler(UIA3Automation automation, AutomationElement rootElement)
+        // The structures needed for the P/Invoke call
+        [StructLayout(LayoutKind.Sequential)]
+        public struct MibTcpRowOwnerPid
         {
-            _automation = automation;
-            _rootElement = rootElement;
-
-            // Timer checks buffer every CheckIntervalMs
-            _flushTimer = new Timer(OnFlushTimerElapsed, null, Timeout.Infinite, Timeout.Infinite);
+            public uint state;
+            public uint localAddr;
+            [MarshalAs(UnmanagedType.ByValArray, SizeConst = 4)]
+            public byte[] localPort;
+            public uint remoteAddr;
+            [MarshalAs(UnmanagedType.ByValArray, SizeConst = 4)]
+            public byte[] remotePort;
+            public uint owningPid;
         }
 
-        public void Start()
+        [StructLayout(LayoutKind.Sequential)]
+        public struct MibTcpTableOwnerPid
         {
-            Console.WriteLine("--- Starting Event Listeners ---");
-
-            _structureChangedHandler = _rootElement.RegisterStructureChangedEvent(
-                TreeScope.Descendants,
-                OnStructureChanged);
-
-            _propertyChangedHandler = _rootElement.RegisterPropertyChangedEvent(
-                TreeScope.Descendants,
-                OnPropertyChanged,
-                _automation.PropertyLibrary.Element.Name,
-                _automation.PropertyLibrary.Element.IsEnabled,
-                _automation.PropertyLibrary.Element.IsOffscreen
-                
-            );
-
-            // start the flush timer
-            _flushTimer.Change(CheckIntervalMs, CheckIntervalMs);
+            public uint dwNumEntries;
+            [MarshalAs(UnmanagedType.ByValArray, SizeConst = 1)]
+            public MibTcpRowOwnerPid[] table;
         }
 
-        private void OnStructureChanged(AutomationElement sender, StructureChangeType changeType, int[] runtimeId)
+        private enum TcpTableClass
         {
-            string key = $"STRUCT:{changeType}:{sender?.Properties.Name.ValueOrDefault}";
-            BufferEvent(key);
+            TcpTableBasicListener,
+            TcpTableBasicConnections,
+            TcpTableBasicAll,
+            TcpTableOwnerPidListener,
+            TcpTableOwnerPidConnections,
+            TcpTableOwnerPidAll,
+            TcpTableOwnerModuleListener,
+            TcpTableOwnerModuleConnections,
+            TcpTableOwnerModuleAll,
         }
 
-        private void OnPropertyChanged(AutomationElement sender, PropertyId propertyId, object newValue)
+        public static List<MibTcpRowOwnerPid> GetTcpConnectionsForProcess(int processId)
         {
-            string key = $"PROP:{propertyId.Name}:{sender?.Properties.Name.ValueOrDefault}:{newValue}";
-            BufferEvent(key);
-        }
+            var connections = new List<MibTcpRowOwnerPid>();
+            int bufferSize = 0;
 
-        private void BufferEvent(string eventKey)
-        {
-            lock (_bufferLock)
+            // Get the required buffer size
+            GetExtendedTcpTable(IntPtr.Zero, ref bufferSize, true, 2, TcpTableClass.TcpTableOwnerPidAll, 0);
+            IntPtr buffer = Marshal.AllocHGlobal(bufferSize);
+
+            try
             {
-                _eventBuffer.Add(eventKey);
-                _sinceLastEvent.Restart();
+                if (GetExtendedTcpTable(buffer, ref bufferSize, true, 2, TcpTableClass.TcpTableOwnerPidAll, 0) == 0)
+                {
+                    var table = (MibTcpTableOwnerPid)Marshal.PtrToStructure(buffer, typeof(MibTcpTableOwnerPid));
+                    IntPtr rowPtr = (IntPtr)((long)buffer + Marshal.SizeOf(table.dwNumEntries));
+
+                    for (int i = 0; i < table.dwNumEntries; i++)
+                    {
+                        var row = (MibTcpRowOwnerPid)Marshal.PtrToStructure(rowPtr, typeof(MibTcpRowOwnerPid));
+                        if (row.owningPid == processId)
+                        {
+                            connections.Add(row);
+                        }
+                        rowPtr = (IntPtr)((long)rowPtr + Marshal.SizeOf(row));
+                    }
+                }
             }
-        }
-
-        private void OnFlushTimerElapsed(object? state)
-        { 
-            HashSet<string>? toFlush = null;
-            long idleMs;
-
-            lock (_bufferLock)
+            finally
             {
-                if (_eventBuffer.Count == 0) return;
-
-                idleMs = _sinceLastEvent.ElapsedMilliseconds;
-                if (idleMs < MinIdleMs) return; // still within active period
-
-                toFlush = new HashSet<string>(_eventBuffer);
-                _eventBuffer.Clear();
-                _sinceLastEvent.Reset();
+                Marshal.FreeHGlobal(buffer);
             }
-
-            Console.WriteLine($"\n[Buffered Events Flushed after {idleMs} ms idle]:");
-            foreach (var ev in toFlush)
-                Console.WriteLine(ev);
-        }
-
-        public void Dispose()
-        {
-            Console.WriteLine("\n--- Stopping Event Listeners ---");
-            _structureChangedHandler?.Dispose();
-            _propertyChangedHandler?.Dispose();
-            _flushTimer.Dispose();
+            return connections;
         }
     }
 
+#region Component: The Network Monitor
+
+public class NetworkMonitor : IDisposable
+{
+    private readonly Process _process;
+    private HashSet<string> _baselineConnections = new HashSet<string>();
+    private readonly object _lock = new();
+
+    public long LastActivityTimestamp { get; private set; }
+    public bool WasActive { get; private set; }
+
+    public NetworkMonitor(Process process)
+    {
+        _process = process;
+    }
+
+    public void StartMonitoring()
+    {
+        lock (_lock)
+        {
+            WasActive = false;
+            _baselineConnections = GetActiveConnectionStrings();
+            LastActivityTimestamp = 0; // Reset timestamp
+        }
+    }
+
+    public void StopMonitoring()
+    {
+        lock (_lock)
+        {
+            _baselineConnections.Clear();
+        }
+    }
+
+    public bool CheckForNewActivity()
+    {
+        var newConnectionsFound = false;
+        var currentConnections = GetActiveConnectionStrings();
+
+        // Check if any current connection is not in our baseline
+        foreach (var connection in currentConnections)
+        {
+            if (!_baselineConnections.Contains(connection))
+            {
+                newConnectionsFound = true;
+                // Add the new connection to the baseline so we don't flag it again
+                lock (_lock)
+                {
+                    _baselineConnections.Add(connection);
+                }
+            }
+        }
+        
+        if (newConnectionsFound)
+        {
+            WasActive = true;
+            LastActivityTimestamp = Stopwatch.GetTimestamp();
+        }
+
+        return newConnectionsFound;
+    }
+
+    private HashSet<string> GetActiveConnectionStrings()
+    {
+        var connectionStrings = new HashSet<string>();
+        try
+        {
+            var connections = TcpConnectionHelper.GetTcpConnectionsForProcess(_process.Id);
+            foreach (var conn in connections)
+            {
+                // Create a unique string for each connection endpoint pair
+                string local = new System.Net.IPAddress(BitConverter.GetBytes(conn.localAddr)).ToString();
+                string remote = new System.Net.IPAddress(BitConverter.GetBytes(conn.remoteAddr)).ToString();
+                connectionStrings.Add($"{local}:{conn.localPort[0]}-{remote}:{conn.remotePort[0]}");
+            }
+        }
+        catch { /* Ignore errors */ }
+        return connectionStrings;
+    }
+
+    public void Dispose()
+    {
+        // Nothing to dispose in this simple version, but good practice to have.
+    }
+}
+#endregion
 
 
 
+    // =======================================================================================
+    // === FINAL ARCHITECTURE: Decoupled Asynchronous Monitoring
+    // =======================================================================================
+
+#region Component 1: The Central Coordinator (CORRECTED STABILITY LOGIC)
+
+public class CausalityManager : IDisposable
+{
+    private readonly TopWindowScraper _scraper;
+    private readonly ActionHandler _actionHandler;
+    private readonly ConsequenceHandler _consequenceHandler;
+    private readonly ProcessMonitor _processMonitor;
+    private readonly NetworkMonitor _networkMonitor;
+    private readonly Timer _mainPollingTimer;
     
+    private readonly object _lock = new();
+    private CausalityChain? _activeChain;
+    
+    public bool IsChainActive => _activeChain != null;
+
+    public CausalityManager(TopWindowScraper scraper, UIA3Automation automation, AutomationElement rootElement)
+    {
+        _scraper = scraper;
+        var targetProcess = Process.GetProcessById(rootElement.Properties.ProcessId);
+        
+        _actionHandler = new ActionHandler(this, automation, rootElement);
+        _processMonitor = new ProcessMonitor(targetProcess);
+        _networkMonitor = new NetworkMonitor(targetProcess);
+        _consequenceHandler = new ConsequenceHandler(automation, rootElement); 
+        
+        _mainPollingTimer = new Timer(OnManagerTimerElapsed, null, Timeout.Infinite, Timeout.Infinite);
+    }
+
+    public void Start()
+    {
+        Console.WriteLine("--- Starting Event Listeners (CPU, GPU, Threads, I/O, Network) ---");
+        _actionHandler.StartListening();
+        _consequenceHandler.StartListening();
+        _mainPollingTimer.Change(100, 100);
+    }
+
+    public void OnActionDetected(ActionEventInfo actionInfo)
+    {
+        lock (_lock)
+        {
+            if (_activeChain == null)
+            {
+                _activeChain = new CausalityChain(actionInfo, _scraper);
+                _processMonitor.StartMonitoring();
+                _networkMonitor.StartMonitoring();
+            }
+        }
+    }
+    
+    private void OnManagerTimerElapsed(object? state)
+    {
+        CausalityChain? chainToReport = null;
+        var newEvents = _consequenceHandler.DrainEvents();
+        
+        lock (_lock)
+        {
+            if (_activeChain != null)
+            {
+                // Poll the network monitor on each tick. The ProcessMonitor polls itself.
+                _networkMonitor.CheckForNewActivity();
+                foreach (var ev in newEvents) { _activeChain.AddConsequence(ev); }
+
+                long now = Stopwatch.GetTimestamp();
+                long quietPeriodTicks = (long)(0.4 * Stopwatch.Frequency);
+
+                // =======================================================================
+                // === THE FIX: Stability now depends on the latest activity from ANY monitor,
+                // === INCLUDING the UI event handler itself.
+                // =======================================================================
+                long lastProcessActivity = _processMonitor.LastActivityTimestamp;
+                long lastNetworkActivity = _networkMonitor.LastActivityTimestamp;
+                long lastUiEventActivity = _consequenceHandler.LastEventTimestamp;
+                
+                // Get the most recent timestamp from all three sources
+                long lastOverallActivity = Math.Max(lastUiEventActivity, Math.Max(lastProcessActivity, lastNetworkActivity));
+
+                bool isIdle = (now - lastOverallActivity) > quietPeriodTicks;
+                
+                // Pass the latest stats from all monitors to the chain for reporting
+                _activeChain.UpdateTimings(isIdle, _processMonitor.GetFinalStats(), _networkMonitor.WasActive);
+                
+                if (isIdle || _activeChain.IsTimedOut())
+                {
+                    _processMonitor.StopMonitoring();
+                    _networkMonitor.StopMonitoring();
+                    chainToReport = _activeChain;
+                    _activeChain = null;
+                }
+            }
+            else if (newEvents.Count > 0)
+            {
+                PrintAmbientBatch(newEvents);
+            }
+        }
+        
+        if (chainToReport != null)
+        {
+            var finalEvents = _consequenceHandler.DrainEvents();
+            foreach (var ev in finalEvents) { chainToReport.AddConsequence(ev); }
+            
+            chainToReport.PrintReport();
+        }
+    }
+
+    private void PrintAmbientBatch(HashSet<string> batch)
+    {
+        Console.ForegroundColor = ConsoleColor.Blue;
+        Console.WriteLine($"\n[Ambient Event | {batch.Count} unique structural changes in ~100ms]");
+        foreach (var c in batch.OrderBy(x => x)) { Console.WriteLine($"   - {c}"); }
+        Console.ResetColor();
+    }
+    
+    public void Dispose()
+    {
+        _actionHandler.Dispose();
+        _consequenceHandler.Dispose();
+        _processMonitor.Dispose();
+        _networkMonitor.Dispose();
+        _mainPollingTimer.Dispose();
+    }
+}
+#endregion
+    #region Component 2: The Action Handler (Unchanged)
+
+    public class ActionHandler : IDisposable
+{
+    private readonly CausalityManager _manager;
+    private readonly UIA3Automation _automation;
+    private readonly AutomationElement _rootElement;
+    private AutomationEventHandlerBase? _invokeHandler, _selectionHandler;
+
+    public ActionHandler(CausalityManager manager, UIA3Automation auto, AutomationElement root)
+    {
+        _manager = manager; _automation = auto; _rootElement = root;
+    }
+
+    public void StartListening()
+    {
+        _invokeHandler = _rootElement.RegisterAutomationEvent(_automation.EventLibrary.Invoke.InvokedEvent, TreeScope.Descendants, (s, e) => ProcessEvent(s, "INVOKED"));
+        _selectionHandler = _rootElement.RegisterAutomationEvent(_automation.EventLibrary.SelectionItem.ElementSelectedEvent, TreeScope.Descendants, (s, e) => ProcessEvent(s, "SELECTED"));
+    }
+
+    private void ProcessEvent(AutomationElement? sender, string eventType)
+    {
+        if (sender == null) return;
+        var actionInfo = new ActionEventInfo(IdGenerator.GenerateIdFromIntArray(sender.Properties.RuntimeId), eventType, sender.Name, sender);
+        _manager.OnActionDetected(actionInfo);
+    }
+
+    public void Dispose() { _invokeHandler?.Dispose(); _selectionHandler?.Dispose(); }
+}
+#endregion
+
+#region Component 3: The Process Monitor (MODIFIED for I/O)
+
+public class ProcessMonitor : IDisposable
+{
+    // MODIFIED: Record now includes all performance metrics for a detailed report
+    public record MonitorStats(
+        // Peak Values
+        float PeakCpu, float PeakGpu, int PeakThreads, 
+        float PeakIoRead, float PeakIoWrite,
+        // Initial Values
+        int InitialThreads,
+        // Final Values for reporting
+        float FinalCpu, float FinalGpu, int FinalThreads,
+        float FinalIoRead, float FinalIoWrite,
+        // Thresholds for context in the report
+        float CpuIdleThreshold, float IoIdleThreshold
+    );
+
+    private readonly Process _process;
+    private readonly Timer _monitorTimer;
+    private readonly object _lock = new();
+
+    // --- Performance Counters for all metrics ---
+    private readonly PerformanceCounter? _cpuCounter;
+    private readonly PerformanceCounter? _gpuCounter;
+    private readonly PerformanceCounter? _ioReadCounter;
+    private readonly PerformanceCounter? _ioWriteCounter;
+
+    private enum MonitorPhase { Storm, Calm }
+    private MonitorPhase _currentPhase;
+
+    private long _lastActivityTimestamp;
+    public long LastActivityTimestamp => Interlocked.Read(ref _lastActivityTimestamp);
+    
+    // --- Fields for tracking statistics ---
+    private float _peakCpuUsage, _lastPolledCpu;
+    private float _peakGpuUsage, _lastPolledGpu;
+    private int _peakThreadCount, _lastPolledThreads;
+    private float _peakIoRead, _lastPolledIoRead;
+    private float _peakIoWrite, _lastPolledIoWrite;
+
+    // --- Baselines and Thresholds ---
+    private int _initialThreadCount;
+    private int _lastSeenThreadCount;
+    private float _baselineGpuUsage;
+    private float _baselineIoRead;
+    private float _baselineIoWrite;
+
+    private const int ThreadSpikeThreshold = 5;
+    private const float HighCpuThreshold = 10.0f; 
+    public const float LowCpuThreshold = 3.0f;
+    private const float IoThresholdBytesPerSec = 2048; // Active if I/O is 2 KB/s over baseline
+
+    private int _consecutiveIdleChecks;
+    private const int IdleChecksRequired = 4;
+    
+    public ProcessMonitor(Process process)
+    {
+        _process = process;
+        // Initialize all counters
+        _cpuCounter = FindPerformanceCounter("Process", "% Processor Time", process);
+        _gpuCounter = FindGpuCounterForDwm();
+        _ioReadCounter = FindPerformanceCounter("Process", "IO Read Bytes/sec", process);
+        _ioWriteCounter = FindPerformanceCounter("Process", "IO Write Bytes/sec", process);
+        
+        _monitorTimer = new Timer(PollProcessState, null, Timeout.Infinite, Timeout.Infinite);
+    }
+    
+    public MonitorStats GetFinalStats()
+    {
+        return new MonitorStats(
+            _peakCpuUsage, _peakGpuUsage, _peakThreadCount, _peakIoRead, _peakIoWrite,
+            _initialThreadCount,
+            _lastPolledCpu, _lastPolledGpu, _lastPolledThreads, _lastPolledIoRead, _lastPolledIoWrite,
+            LowCpuThreshold, IoThresholdBytesPerSec
+        );
+    }
+
+    public void StartMonitoring()
+    {
+        lock (_lock)
+        {
+            _process.Refresh();
+            _initialThreadCount = _process.Threads.Count;
+            _lastSeenThreadCount = _initialThreadCount;
+            
+            // Prime and set baselines for all relevant counters
+            _baselineGpuUsage = _gpuCounter?.NextValue() ?? 0f;
+            _baselineIoRead = _ioReadCounter?.NextValue() ?? 0f;
+            _baselineIoWrite = _ioWriteCounter?.NextValue() ?? 0f;
+
+            // Reset all peak and last-polled stats to their initial state
+            _peakCpuUsage = _lastPolledCpu = 0f;
+            _peakGpuUsage = _lastPolledGpu = _baselineGpuUsage;
+            _peakThreadCount = _lastPolledThreads = _initialThreadCount;
+            _peakIoRead = _lastPolledIoRead = _baselineIoRead;
+            _peakIoWrite = _lastPolledIoWrite = _baselineIoWrite;
+            
+            _currentPhase = MonitorPhase.Storm; 
+            _consecutiveIdleChecks = 0;
+            Interlocked.Exchange(ref _lastActivityTimestamp, Stopwatch.GetTimestamp());
+            _monitorTimer.Change(0, 100);
+        }
+    }
+
+    public void StopMonitoring()
+    {
+        _monitorTimer.Change(Timeout.Infinite, Timeout.Infinite);
+    }
+
+    private void PollProcessState(object? state)
+    {
+        try
+        {
+            _process.Refresh();
+            // Poll all current values
+            _lastPolledCpu = (_cpuCounter?.NextValue() ?? 0f) / Environment.ProcessorCount;
+            _lastPolledThreads = _process.Threads.Count;
+            _lastPolledGpu = _gpuCounter?.NextValue() ?? 0f;
+            _lastPolledIoRead = _ioReadCounter?.NextValue() ?? 0f;
+            _lastPolledIoWrite = _ioWriteCounter?.NextValue() ?? 0f;
+
+            // Update all peak values
+            _peakCpuUsage = Math.Max(_peakCpuUsage, _lastPolledCpu);
+            _peakThreadCount = Math.Max(_peakThreadCount, _lastPolledThreads);
+            _peakGpuUsage = Math.Max(_peakGpuUsage, _lastPolledGpu);
+            _peakIoRead = Math.Max(_peakIoRead, _lastPolledIoRead);
+            _peakIoWrite = Math.Max(_peakIoWrite, _lastPolledIoWrite);
+            
+            // --- Define all activity flags ---
+            bool hasHighCpuWork = _lastPolledCpu > HighCpuThreshold;
+            bool hasLowCpuWork = _lastPolledCpu > LowCpuThreshold;
+            bool isMajorJobRunning = _lastPolledThreads > _initialThreadCount + ThreadSpikeThreshold;
+            bool hasMinorThreadChange = _lastPolledThreads != _lastSeenThreadCount;
+            bool hasGpuWork = _lastPolledGpu > _baselineGpuUsage + 1.0f;
+            bool hasIoActivity = _lastPolledIoRead > _baselineIoRead + IoThresholdBytesPerSec ||
+                                 _lastPolledIoWrite > _baselineIoWrite + IoThresholdBytesPerSec;
+
+            // --- State Machine Logic ---
+            if (_currentPhase == MonitorPhase.Storm)
+            {
+                if (hasHighCpuWork || isMajorJobRunning)
+                {
+                    UpdateActivityTimestampAndBaselines();
+                }
+                else
+                {
+                    // The storm has passed. Transition to the calm phase.
+                    _currentPhase = MonitorPhase.Calm;
+                    _consecutiveIdleChecks = 0;
+                }
+            }
+            
+            if (_currentPhase == MonitorPhase.Calm)
+            {
+                // In the calm phase, any low-level chatter resets the idle countdown.
+                if (hasLowCpuWork || hasMinorThreadChange || hasGpuWork || hasIoActivity)
+                {
+                    _consecutiveIdleChecks = 0;
+                    UpdateActivityTimestampAndBaselines();
+                }
+                else
+                {
+                    _consecutiveIdleChecks++;
+                }
+
+                // If a new storm starts, switch back immediately.
+                if (hasHighCpuWork || isMajorJobRunning)
+                {
+                    _currentPhase = MonitorPhase.Storm;
+                }
+            }
+        }
+        catch { StopMonitoring(); }
+    }
+    
+    private void UpdateActivityTimestampAndBaselines()
+    {
+        Interlocked.Exchange(ref _lastActivityTimestamp, Stopwatch.GetTimestamp());
+        _lastSeenThreadCount = _lastPolledThreads;
+        _baselineGpuUsage = _lastPolledGpu;
+        _baselineIoRead = _lastPolledIoRead;
+        _baselineIoWrite = _lastPolledIoWrite;
+    }
+
+    // --- Helper and Dispose methods ---
+    private PerformanceCounter? FindPerformanceCounter(string categoryName, string counterName, Process process)
+    {
+        try
+        {
+            var category = new PerformanceCounterCategory(categoryName);
+            string? instanceName = GetPerformanceCounterInstanceName(process, category);
+            if (instanceName != null)
+            {
+                var counter = new PerformanceCounter(categoryName, counterName, instanceName, true);
+                counter.NextValue(); // Prime the counter
+                return counter;
+            }
+        } 
+        catch { /* Suppress errors */ }
+        return null;
+    }
+
+    private PerformanceCounter? FindGpuCounterForDwm()
+    {
+        try
+        {
+            var dwmProcess = Process.GetProcessesByName("dwm").FirstOrDefault();
+            if (dwmProcess == null) return null;
+            
+            var category = new PerformanceCounterCategory("GPU Engine");
+            string instanceNamePrefix = $"pid_{dwmProcess.Id}";
+            
+            foreach (var instance in category.GetInstanceNames())
+            {
+                if (instance.Contains(instanceNamePrefix) && instance.EndsWith("engtype_3D"))
+                {
+                    return new PerformanceCounter("GPU Engine", "Utilization Percentage", instance, true);
+                }
+            }
+        } 
+        catch { /* Suppress errors */ }
+        return null;
+    }
+
+    private static string? GetPerformanceCounterInstanceName(Process process, PerformanceCounterCategory category)
+    {
+        string processName = process.ProcessName;
+        var instances = category.GetInstanceNames()
+            .Where(inst => inst.StartsWith(processName, StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+
+        if (!instances.Any()) return null;
+        if (instances.Length == 1) return instances[0];
+
+        foreach (var instance in instances)
+        {
+            using (var counter = new PerformanceCounter("Process", "ID Process", instance, true))
+            {
+                if ((int)counter.RawValue == process.Id)
+                {
+                    return instance;
+                }
+            }
+        }
+        return instances[0]; // Fallback
+    }
+
+    public void Dispose()
+    {
+        _cpuCounter?.Dispose();
+        _gpuCounter?.Dispose();
+        _ioReadCounter?.Dispose();
+        _ioWriteCounter?.Dispose();
+        _monitorTimer.Dispose();
+    }
+}
+#endregion
+#region Component 4: The Consequence Handler (Passive Collector)
+
+public class ConsequenceHandler : IDisposable
+{
+    private readonly AutomationElement _rootElement;
+    private StructureChangedEventHandlerBase? _structureHandler;
+    
+    private readonly object _bufferLock = new();
+    private HashSet<string> _internalBuffer = new HashSet<string>();
+
+    public long LastEventTimestamp { get; private set; }
+
+    public ConsequenceHandler(UIA3Automation auto, AutomationElement root)
+    {
+        _rootElement = root;
+        // Initialize with a value that is not zero to prevent immediate stability on start
+        LastEventTimestamp = Stopwatch.GetTimestamp();
+    }
+
+    public void StartListening()
+    {
+        _structureHandler = _rootElement.RegisterStructureChangedEvent(TreeScope.Descendants, (s, ct, rid) => ProcessEvent(s, $"STRUCT:{ct}"));
+    }
+
+    private void ProcessEvent(AutomationElement? sender, string eventType)
+    {
+        if (sender == null) return;
+        
+        try
+        {
+            // Update the timestamp on every single event
+            LastEventTimestamp = Stopwatch.GetTimestamp();
+            string consequence = $"{eventType}:{sender.Properties.Name.ValueOrDefault ?? "unnamed"}:{sender.Properties.ClassName.ValueOrDefault ?? "unnamed"} ({sender.ControlType})";
+            
+            lock(_bufferLock) { _internalBuffer.Add(consequence); }
+        } catch { /* Ignore */ }
+    }
+    
+    public HashSet<string> DrainEvents()
+    {
+        HashSet<string> drainedEvents;
+        lock (_bufferLock)
+        {
+            if (_internalBuffer.Count == 0) return new HashSet<string>();
+            drainedEvents = _internalBuffer;
+            _internalBuffer = new HashSet<string>();
+        }
+        return drainedEvents;
+    }
+    
+    public void Dispose() { _structureHandler?.Dispose(); }
+}
+#endregion
+#region Component 5: The Causality Chain Logic (MODIFIED for I/O Report)
+
+public class CausalityChain
+{
+    public ActionEventInfo Trigger { get; }
+    private readonly TopWindowScraper _scraper;
+    public HashSet<string> Consequences { get; } = new HashSet<string>();
+    private readonly Stopwatch _operationStopwatch = new Stopwatch();
+    private const long TimeoutMs = 80000;
+
+    private long _jobCompleteTimeMs = -1;
+    
+    // Use the new, more detailed MonitorStats record
+    private ProcessMonitor.MonitorStats _monitorStats = new(0,0,0,0,0,0,0,0,0,0,0,0,0);
+    private bool _networkActivityDetected;
+
+    public CausalityChain(ActionEventInfo trigger, TopWindowScraper scraper)
+    { 
+        Trigger = trigger;
+        _scraper = scraper;
+        _operationStopwatch.Restart();
+    }
+
+    public bool AddConsequence(string c) => Consequences.Add(c);
+    public bool IsTimedOut() => _operationStopwatch.ElapsedMilliseconds > TimeoutMs;
+
+    public void UpdateTimings(bool isJobComplete, ProcessMonitor.MonitorStats stats, bool networkActivityDetected)
+    {
+        if (_jobCompleteTimeMs == -1 && isJobComplete) _jobCompleteTimeMs = _operationStopwatch.ElapsedMilliseconds;
+        _monitorStats = stats;
+        _networkActivityDetected = networkActivityDetected;
+    }
+    
+    public void PrintReport()
+    {
+        string? cleanName = _scraper.GetComponentNameBySignature(Trigger.Signature);
+        string reason = IsTimedOut() ? "TIMEOUT" : "STABLE";
+        long totalElapsedMs = _operationStopwatch.ElapsedMilliseconds;
+        long activeTime = _jobCompleteTimeMs != -1 ? _jobCompleteTimeMs : totalElapsedMs;
+
+        Console.ForegroundColor = ConsoleColor.DarkGray;
+        Console.WriteLine("\n═════════════════════════════════ STABILITY REPORT ═════════════════════════════════");
+        Console.ForegroundColor = (reason == "TIMEOUT") ? ConsoleColor.DarkYellow : ConsoleColor.Green;
+        
+        Console.WriteLine($"[Report] Action '{Trigger.EventType}' on: {cleanName ?? Trigger.Name}");
+        
+        int threadIncrease = _monitorStats.PeakThreads - _monitorStats.InitialThreads;
+        
+        Console.WriteLine($" ├─ Activity Summary:");
+        Console.WriteLine($" │  ├─ CPU Usage:     Peaked at {_monitorStats.PeakCpu:F2} %");
+        Console.WriteLine($" │  ├─ GPU Usage:     Peaked at {_monitorStats.PeakGpu:F2} %");
+        Console.WriteLine($" │  ├─ Disk I/O:      Peaked at {_monitorStats.PeakIoRead / 1024:F1} KB/s read, {_monitorStats.PeakIoWrite / 1024:F1} KB/s write");
+        Console.WriteLine($" │  ├─ Thread Count:  Started with {_monitorStats.InitialThreads}, peaked at {_monitorStats.PeakThreads} (+{threadIncrease})");
+        Console.WriteLine($" │  └─ Network I/O:   {(_networkActivityDetected ? "New TCP connections detected" : "No new connections")}");
+
+        if (reason == "STABLE")
+        {
+            Console.WriteLine($" ├─ Stability Criteria (Reason for STABLE):");
+            Console.WriteLine($" │  ├─ Final CPU:     {_monitorStats.FinalCpu:F2} % (below the {_monitorStats.CpuIdleThreshold:F1} % threshold)");
+            Console.WriteLine($" │  ├─ Final I/O:     {_monitorStats.FinalIoRead / 1024:F1} KB/s read, {_monitorStats.FinalIoWrite / 1024:F1} KB/s write (returned to baseline)");
+            Console.WriteLine($" │  ├─ Final Threads: {_monitorStats.FinalThreads} (stable, no recent changes)");
+            Console.WriteLine($" │  └─ Final GPU:     {_monitorStats.FinalGpu:F2} % (returned to baseline activity)");
+        }
+        
+        Console.WriteLine($" └─ Result:          Process was active for {activeTime} ms. Declared {reason} after a total of {totalElapsedMs} ms.");
+        
+        if (Consequences.Count > 0)
+        {
+            Console.ForegroundColor = ConsoleColor.DarkGray;
+            Console.WriteLine($"\n   [Discovered {Consequences.Count} unique UI reactions]");
+            foreach (var c in Consequences.OrderBy(x => x)) { Console.WriteLine($"       - {c}"); }
+        }
+        Console.WriteLine("════════════════════════════════════════════════════════════════════════════════════");
+        Console.ResetColor();
+    }
+}
+    #endregion
     // ===================================================================
     //  Semantic Rule Providers
     // ===================================================================
@@ -644,7 +1266,7 @@ namespace DesktopElementInspector
         
         private void RobustPing(AutomationElement element, int depth)
         {
-            const int maxDepth = 8;
+            const int maxDepth = 9;
             if (depth > maxDepth || element == null)
             {
                 return;
@@ -735,9 +1357,9 @@ namespace DesktopElementInspector
             stopwatcht.Stop();
             Console.WriteLine($"--- Time for Total: {stopwatcht.ElapsedMilliseconds} ms ---");
 
-            using (var handler = new UiEventHandler(_automation, windowElement))
+            using (var manager = new CausalityManager(this, _automation, windowElement))
             {
-                handler.Start();
+                manager.Start();
 
                 Console.WriteLine("\nEvent listeners are now active.");
                 Console.WriteLine("Interact with the target window to see real-time UI changes...");
@@ -1146,7 +1768,7 @@ public TreeNode? Scrape(AutomationElement elementToScrape)
                     return new DesktopScrapedElementDto(
                        Name: name, ControlType: controlType,
                        ClassName: className, ParentName: parentNode?.Data.Name,
-                       RuntimeId: default,
+                       RuntimeId: element.Properties.RuntimeId.ValueOrDefault,
                        IsImportant: true);
                 }
                 else
